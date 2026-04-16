@@ -33,41 +33,74 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
 
 // Parse raw commit data into a Commit struct.
 int commit_parse(const void *data, size_t len, Commit *commit_out) {
-    (void)len;
-    const char *p = (const char *)data;
+    char *buf = malloc(len + 1);
+    if (!buf) return -1;
+    memcpy(buf, data, len);
+    buf[len] = '\0';
+
+    const char *p = buf;
     char hex[HASH_HEX_SIZE + 1];
 
-    // "tree <hex>\n"
-    if (sscanf(p, "tree %64s\n", hex) != 1) return -1;
-    if (hex_to_hash(hex, &commit_out->tree) != 0) return -1;
-    p = strchr(p, '\n') + 1;
+    if (sscanf(p, "tree %64s\n", hex) != 1) {
+        free(buf);
+        return -1;
+    }
+    if (hex_to_hash(hex, &commit_out->tree) != 0) {
+        free(buf);
+        return -1;
+    }
+    p = strchr(p, '\n');
+    if (!p) { free(buf); return -1; }
+    p++;
 
-    // optional "parent <hex>\n"
     if (strncmp(p, "parent ", 7) == 0) {
-        if (sscanf(p, "parent %64s\n", hex) != 1) return -1;
-        if (hex_to_hash(hex, &commit_out->parent) != 0) return -1;
+        if (sscanf(p, "parent %64s\n", hex) != 1) {
+            free(buf);
+            return -1;
+        }
+        if (hex_to_hash(hex, &commit_out->parent) != 0) {
+            free(buf);
+            return -1;
+        }
         commit_out->has_parent = 1;
-        p = strchr(p, '\n') + 1;
+        p = strchr(p, '\n');
+        if (!p) { free(buf); return -1; }
+        p++;
     } else {
         commit_out->has_parent = 0;
     }
 
-    // "author <name> <timestamp>\n"
     char author_buf[256];
-    uint64_t ts;
-    if (sscanf(p, "author %255[^\n]\n", author_buf) != 1) return -1;
-    // split off trailing timestamp
+    if (sscanf(p, "author %255[^\n]\n", author_buf) != 1) {
+        free(buf);
+        return -1;
+    }
+
     char *last_space = strrchr(author_buf, ' ');
-    if (!last_space) return -1;
-    ts = (uint64_t)strtoull(last_space + 1, NULL, 10);
+    if (!last_space) {
+        free(buf);
+        return -1;
+    }
+
+    commit_out->timestamp = (uint64_t)strtoull(last_space + 1, NULL, 10);
     *last_space = '\0';
     snprintf(commit_out->author, sizeof(commit_out->author), "%s", author_buf);
-    commit_out->timestamp = ts;
-    p = strchr(p, '\n') + 1;  // skip author line
-    p = strchr(p, '\n') + 1;  // skip committer line
-    p = strchr(p, '\n') + 1;  // skip blank line
+
+    p = strchr(p, '\n');
+    if (!p) { free(buf); return -1; }
+    p++;
+
+    p = strchr(p, '\n');
+    if (!p) { free(buf); return -1; }
+    p++;
+
+    p = strchr(p, '\n');
+    if (!p) { free(buf); return -1; }
+    p++;
 
     snprintf(commit_out->message, sizeof(commit_out->message), "%s", p);
+
+    free(buf);
     return 0;
 }
 
@@ -196,6 +229,45 @@ int head_update(const ObjectID *new_commit) {
 int commit_create(const char *message, ObjectID *commit_id_out) {
     // TODO: Implement commit creation
     // (See Lab Appendix for logical steps)
-    (void)message; (void)commit_id_out;
-    return -1;
+    if (!message || !commit_id_out) return -1;
+
+    Commit commit;
+    memset(&commit, 0, sizeof(commit));
+
+    // Build tree from staged index
+    if (tree_from_index(&commit.tree) != 0)
+        return -1;
+
+    // Parent commit if HEAD already points to one
+    if (head_read(&commit.parent) == 0)
+        commit.has_parent = 1;
+    else
+        commit.has_parent = 0;
+
+    // Author and timestamp
+    snprintf(commit.author, sizeof(commit.author), "%s", pes_author());
+    commit.timestamp = (uint64_t)time(NULL);
+
+    // Commit message
+    snprintf(commit.message, sizeof(commit.message), "%s", message);
+
+    // Serialize commit
+    void *data = NULL;
+    size_t len = 0;
+    if (commit_serialize(&commit, &data, &len) != 0)
+        return -1;
+
+    // Write commit object
+    if (object_write(OBJ_COMMIT, data, len, commit_id_out) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+
+    // Move HEAD/current branch to new commit
+    if (head_update(commit_id_out) != 0)
+        return -1;
+
+    return 0;
 }
